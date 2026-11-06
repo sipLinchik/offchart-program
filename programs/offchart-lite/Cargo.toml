@@ -1,0 +1,33 @@
+[package]
+name = "offchart-lite"
+version = "0.1.0"
+description = "Offchart P2P settlement program for Solana (pinocchio, no Anchor)"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "offchart_lite"
+
+[features]
+default = []
+# profiling only: keeps handlers out-of-line for size analysis
+prof = []
+
+[dependencies]
+pinocchio = { version = "=0.12.0", default-features = false, features = ["cpi", "copy"] }
+solana-address = { version = "=2.9.0", default-features = false, features = ["decode"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+# money math uses explicit checked_* arithmetic everywhere
+overflow-checks = false
+incremental = false
