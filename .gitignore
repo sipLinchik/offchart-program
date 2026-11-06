@@ -1,0 +1,6 @@
+target/
+*.so
+*.json.keypair
+*-keypair.json
+id.json
+.env*
