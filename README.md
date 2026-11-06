@@ -150,20 +150,6 @@ solana-verify verify-from-repo -u https://api.mainnet-beta.solana.com \
 └── CONTRIBUTING.md
 ```
 
-## Disclaimer
-
-⚠️ Please read before interacting with the program.
-
-- **Not audited.** This program has not undergone a security audit. A reproducible build shows the
-  deployed binary matches this source; it is not an audit.
-- **Upgradeable.** The program can be upgraded by its upgrade authority
-  (`4WfpzfRrhC3idmkWjfJpHCyVbxcSjesDpPncz3hZgHer`). Whether this stays a single key, moves to a multisig,
-  or becomes immutable has not been decided.
-- **Configurable fee.** The fee is set by the admin via `set_config` and is capped on-chain at 300 bps (3%).
-- The Solana Verified Program badge has not been obtained yet.
-
-Use at your own risk. See [SECURITY.md](SECURITY.md) to report vulnerabilities.
-
 ## License
 
 [MIT](LICENSE) © 2026 Offchart

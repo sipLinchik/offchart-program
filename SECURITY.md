@@ -17,5 +17,5 @@ In scope: the on-chain program source in `programs/offchart-lite`, deployed at
 
 ## Status of the program
 
-The program has **not been audited**, and it is **upgradeable**. See the
-[disclaimer in the README](README.md#disclaimer) before interacting with it.
+The program is **upgradeable** by its upgrade authority. Please report security
+concerns using the process above.
