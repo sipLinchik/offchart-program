@@ -1,13 +1,13 @@
-//! Admin and order-lifecycle instructions of the offchart-lite program: init_config, set_config, upsert_token_config,
-//! block_token, create_order, cancel_order, keeper_cancel_order (update_order was cut: D-rM3-01). Same discriminators / argument
-//! encodings / account orders / error numbers as the Anchor program of r8 (D-rM2-02). Hardened in rM3: see the
-//! arithmetic table in qa/reports/rM3.md and DECISIONS D-rM3-*.
+//! Admin and order-lifecycle instructions of the offchart-lite program: init_config, set_config, create_order, cancel_order, keeper_cancel_order
+//! (update_order was cut: D-rM3-01; there are no TokenConfig instructions: any compatible mint trades without registration). Discriminators,
+//! argument encodings and account orders follow the r8 layout; `init_config` / `set_config` / `create_order` validate the rCap limits record
+//! (cap + format marker) in `Config.oracle`. Arithmetic table: qa/reports/rM3.md, DECISIONS D-rM3-* and D-rCap-*.
 use super::*;
 
+/// "OFFCAPv1" — format marker of the limits record in Config.oracle
+pub(super) const LIMITS_MAGIC: [u8; 8] = *b"OFFCAPv1";
 const D_INIT_CONFIG: u64 = u64::from_le_bytes([0x17, 0xeb, 0x73, 0xe8, 0xa8, 0x60, 0x01, 0xe7]);
 const D_SET_CONFIG: u64 = u64::from_le_bytes([0x6c, 0x9e, 0x9a, 0xaf, 0xd4, 0x62, 0x34, 0x42]);
-const D_UPSERT: u64 = u64::from_le_bytes([0x19, 0x10, 0x18, 0x47, 0xf1, 0x43, 0x7b, 0xaa]);
-const D_BLOCK: u64 = u64::from_le_bytes([0xb5, 0x72, 0xf1, 0x7a, 0xcc, 0xa5, 0xcb, 0x37]);
 const D_CREATE: u64 = u64::from_le_bytes([0x8d, 0x36, 0x25, 0xcf, 0xed, 0xd2, 0xfa, 0xd7]);
 const D_CANCEL: u64 = u64::from_le_bytes([0x5f, 0x81, 0xed, 0xf0, 0x08, 0x31, 0xdf, 0x84]);
 const D_KCANCEL: u64 = u64::from_le_bytes([0xeb, 0x54, 0x2b, 0xec, 0x2d, 0xbe, 0x3f, 0xbf]);
@@ -74,8 +74,6 @@ pub fn dispatch(pid: &Address, accounts: &mut [AccountView], disc: u64, args: &[
     match disc {
         D_INIT_CONFIG => init_config(pid, accounts, &mut r),
         D_SET_CONFIG => set_config(pid, accounts, &mut r),
-        D_UPSERT => upsert(pid, accounts, &mut r),
-        D_BLOCK => block(pid, accounts),
         D_CREATE => create_order(pid, accounts, &mut r),
         D_CANCEL => cancel(pid, accounts, &mut r),
         D_KCANCEL => keeper_cancel(pid, accounts),
@@ -91,12 +89,24 @@ fn admin_cfg<'a>(pid: &Address, admin: &AccountView, cfg: &'a AccountView) -> Re
     Ok(c)
 }
 
+/// rCap: the Config `oracle` slot (32 B) is the LIMITS record, validated on every use (settle, create_order, init/set_config):
+/// bytes 0..8 = max USD value of ONE order in 1e-6 USD (u64 LE, > 0); bytes 8..16 = the format marker `LIMITS_MAGIC`; bytes 16..32 = zero.
+/// A pre-rCap Config (a real key in this slot) fails the marker check and is REFUSED (6043) — never reinterpreted as a cap.
+pub(super) fn limits_ok(k: &[u8; 32]) -> bool {
+    let mut z = 0u8;
+    for b in k.iter().skip(16) {
+        z |= *b;
+    }
+    z == 0 && k[8..16] == LIMITS_MAGIC && u64::from_le_bytes([k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]]) > 0
+}
+
 // accounts: admin(w,s) config(w) delegate escrow program program_data system
 #[cfg_attr(feature = "prof", inline(never))]
 fn init_config(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> ProgramResult {
     let (keeper, oracle, treasury) = (r.take::<32>()?, r.take::<32>()?, r.take::<32>()?);
     let max_age = r.u64()?;
     ensure!(max_age > 0 && max_age <= 300 && accounts.len() >= 7, INVALID_ARG);
+    ensure!(limits_ok(oracle), INVALID_ARG);
     let (cb, db, eb);
     {
         let a = &*accounts;
@@ -114,7 +124,7 @@ fn init_config(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Progr
         (cb, db, eb) = (b1, b2, b3);
         let bump = [cb];
         let seeds = [Seed::from(b"config"), Seed::from(&bump)];
-        make_account(admin, &a[1], rent(C_LEN), C_LEN as u64, pid, &[Signer::from(&seeds)])?;
+        make_account(admin, &a[1], rent(C_LEN)?, C_LEN as u64, pid, &[Signer::from(&seeds)])?;
     }
     let admin = *accounts[0].address();
     let c = wv::<C_LEN>(&mut accounts[1]);
@@ -150,6 +160,7 @@ fn set_config(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Progra
     let age = if r.some()? { Some(r.u64()?) } else { None };
     ensure!(fee.map_or(true, |f| f <= 300), FEE_TOO_HIGH);
     ensure!(age.map_or(true, |v| v > 0 && v <= 300), INVALID_ARG);
+    ensure!(keys[2].map_or(true, |k| limits_ok(k)), INVALID_ARG);
     let c = wv::<C_LEN>(&mut accounts[1]);
     for (k, off) in keys.iter().zip([C_ADMIN, C_KEEPER, C_ORACLE, C_TREASURY]) {
         if let Some(v) = k {
@@ -165,68 +176,6 @@ fn set_config(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Progra
     if let Some(v) = age {
         wr!(c, C_MAX_AGE, v);
     }
-    Ok(())
-}
-
-// accounts: admin(w,s) config mint token_config(w) system [vault_base vault_quote]
-#[cfg_attr(feature = "prof", inline(never))]
-fn upsert(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> ProgramResult {
-    ensure!(accounts.len() >= 5, BAD_ACCOUNTS);
-    let status = r.u8()?;
-    let (base, quote) = (r.take::<32>()?, r.take::<32>()?);
-    let tol = r.u16()?;
-    let (tp, bump);
-    {
-        let a = &*accounts;
-        admin_cfg(pid, &a[0], &a[1])?;
-        let mint = &a[2];
-        ensure!(status <= 2 && *mint.address() != NATIVE && *a[4].address() == SYSTEM, INVALID_ARG);
-        tp = mint.owner();
-        ensure!(tp == TOKEN || tp == TOKEN22, BAD_TOKEN_PROG);
-        let m = view::<82>(mint)?;
-        if status == 0 {
-            ensure!(mint.data_len() == 82 && m[45] == 1, UNSUPPORTED_EXT);
-        }
-        let has = *base != [0u8; 32] || *quote != [0u8; 32];
-        if has {
-            ensure!(*base != [0u8; 32] && *quote != [0u8; 32] && tol > 0 && tol <= 10_000 && a.len() == 7, INVALID_ARG);
-            ensure!(a[5].address().as_array() == base && a[6].address().as_array() == quote, BAD_ACCOUNTS);
-            let (b, q) = (tok_any(&a[5])?, tok_any(&a[6])?);
-            ensure!(key!(b, 0) == mint.address().as_array() && key!(q, 0) == NATIVE.as_array(), BAD_TOKEN_ACC);
-        } else {
-            ensure!(tol == 0, INVALID_ARG);
-        }
-        let (pda, b1) = Address::try_find_program_address(&[b"token", mint.address().as_array()], pid).ok_or(BAD_ACCOUNTS)?;
-        ensure!(pda == *a[3].address(), BAD_ACCOUNTS);
-        bump = b1;
-        if a[3].owned_by(&SYSTEM) {
-            let bs = [bump];
-            let seeds = [Seed::from(b"token"), Seed::from(mint.address().as_array()), Seed::from(&bs)];
-            make_account(&a[0], &a[3], rent(T_LEN), T_LEN as u64, pid, &[Signer::from(&seeds)])?;
-        } else {
-            ensure!(a[3].owned_by(pid), BAD_ACCOUNTS);
-        }
-    }
-    let mint_key = *accounts[2].address();
-    let t = wv::<T_LEN>(&mut accounts[3]);
-    wr!(t, 0, DISC_TOKEN_CONFIG);
-    put(t, T_MINT, mint_key.as_array());
-    t[T_STATUS] = status;
-    put(t, 41, tp.as_array());
-    put(t, T_VAULT_BASE, base);
-    put(t, T_VAULT_QUOTE, quote);
-    wr!(t, T_TOLERANCE, tol);
-    t[139] = bump;
-    Ok(())
-}
-
-// accounts: admin(s) config token_config(w)
-#[cfg_attr(feature = "prof", inline(never))]
-fn block(pid: &Address, accounts: &mut [AccountView]) -> ProgramResult {
-    ensure!(accounts.len() >= 3, BAD_ACCOUNTS);
-    admin_cfg(pid, &accounts[0], &accounts[1])?;
-    owned::<T_LEN>(&accounts[2], pid, DISC_TOKEN_CONFIG, TOKEN_NOT_ALLOWED)?;
-    wv::<T_LEN>(&mut accounts[2])[T_STATUS] = 1;
     Ok(())
 }
 
@@ -246,7 +195,8 @@ fn delegate_pda(pid: &Address, cfg: &[u8; C_LEN]) -> Result<Address, ProgramErro
     Address::create_program_address(&[b"delegate", &cb], pid).map_err(|_| BAD_ACCOUNTS)
 }
 
-// accounts: owner(w,s) config order(w) give_mint source give_token_config delegate system [want token configs]
+// accounts: owner(w,s) config order(w) give_mint source delegate system [want mints, same order as args.wants]
+// args: nonce, kind, total, wants: Vec<Pubkey>, min_outs: Vec<u64> (same length), min_fill_bps, partial, expires_at
 #[cfg_attr(feature = "prof", inline(never))]
 fn create_order(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> ProgramResult {
     let nonce = r.u64()?;
@@ -258,19 +208,26 @@ fn create_order(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Prog
     for w in wants.iter_mut().take(wc) {
         *w = *r.take::<32>()?;
     }
-    let (limit, abs, min_fill, partial, expires) = (r.u16()?, r.u64()?, r.u16()?, r.flag()?, r.u64()? as i64);
+    ensure!(r.u32()? as usize == wc, INVALID_ARG);
+    let mut outs = [0u64; 5];
+    for x in outs.iter_mut().take(wc) {
+        *x = r.u64()?;
+        ensure!(*x > 0, INVALID_ARG); // a floor of zero would mean "give it away"
+    }
+    let (min_fill, partial, expires) = (r.u16()?, r.flag()?, r.u64()? as i64);
     let now = Clock::get()?.unix_timestamp;
-    ensure!(accounts.len() == 8 + wc, BAD_ACCOUNTS);
+    ensure!(accounts.len() == 7 + wc, BAD_ACCOUNTS);
     let bump;
     {
         let a = &*accounts;
         let (owner, give_mint, src) = (&a[0], &a[3], &a[4]);
         let cfg = owned::<C_LEN>(&a[1], pid, DISC_CONFIG, BAD_ACCOUNTS)?;
-        ensure!(owner.is_signer() && *a[7].address() == SYSTEM, BAD_ACCOUNTS);
+        ensure!(owner.is_signer() && *a[6].address() == SYSTEM, BAD_ACCOUNTS);
         ensure!(cfg[C_PAUSED] == 0, PAUSED);
+        ensure!(limits_ok(key!(cfg, C_ORACLE)), CONFIG_OLD); // rCap: no new order on a Config whose cap record is not in the current format
         ensure!(total > 0, INVALID_ARG);
-        ensure!(expires > now, EXPIRED); // r8 order of checks/errors
-        ensure!(min_fill <= 10_000 && limit <= 10_000 && kind <= 2, INVALID_ARG);
+        ensure!(expires > now, EXPIRED);
+        ensure!(min_fill <= 10_000 && kind <= 2, INVALID_ARG);
         let gm = give_mint.address();
         let mut native_wanted = false;
         for (i, w) in wants.iter().enumerate().take(wc) {
@@ -279,25 +236,21 @@ fn create_order(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Prog
         }
         match kind {
             0 => ensure!(*gm != NATIVE && wc == 1 && native_wanted, INVALID_ARG),
-            1 => ensure!(*gm == NATIVE && !native_wanted && abs > 0, INVALID_ARG),
+            1 => ensure!(*gm == NATIVE && !native_wanted, INVALID_ARG),
             _ => {}
         }
         let tp = give_mint.owner();
         ensure!(tp == TOKEN || tp == TOKEN22, BAD_TOKEN_PROG);
-        let tc_ok = |acc: &AccountView, mint: &[u8; 32]| -> ProgramResult {
-            if mint == NATIVE.as_array() {
-                return Ok(());
-            }
-            let tc = owned::<T_LEN>(acc, pid, DISC_TOKEN_CONFIG, TOKEN_NOT_ALLOWED)?;
-            ensure!(key!(tc, T_MINT) == mint && tc[T_STATUS] == 0, TOKEN_NOT_ALLOWED);
-            Ok(())
-        };
-        tc_ok(&a[5], gm.as_array())?;
-        for (acc, w) in a.iter().skip(8).zip(wants.iter()).take(wc) {
-            tc_ok(acc, w)?;
+        ensure!(*gm != NATIVE || tp == TOKEN, BAD_TOKEN_PROG);
+        mint_ok(give_mint)?;
+        // every wanted mint must be a real, supported mint at exactly the signed address
+        for (acc, w) in a.iter().skip(7).zip(wants.iter()).take(wc) {
+            ensure!(acc.address().as_array() == w, BAD_ACCOUNTS);
+            ensure!(acc.owned_by(&TOKEN) || acc.owned_by(&TOKEN22), BAD_TOKEN_PROG);
+            mint_ok(acc)?;
         }
         let dl = delegate_pda(pid, cfg)?;
-        ensure!(dl == *a[6].address(), BAD_ACCOUNTS);
+        ensure!(dl == *a[5].address(), BAD_ACCOUNTS);
         check_source(src, owner.address().as_array(), gm.as_array(), &tp, &dl, total)?;
         let nb = nonce.to_le_bytes();
         let (okey, b1) = Address::try_find_program_address(&[b"order", owner.address().as_array(), &nb], pid).ok_or(BAD_ACCOUNTS)?;
@@ -305,7 +258,7 @@ fn create_order(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Prog
         bump = b1;
         let bs = [bump];
         let seeds = [Seed::from(b"order"), Seed::from(owner.address().as_array()), Seed::from(&nb), Seed::from(&bs)];
-        make_account(owner, &a[2], rent(O_LEN), O_LEN as u64, pid, &[Signer::from(&seeds)])?;
+        make_account(owner, &a[2], rent(O_LEN)?, O_LEN as u64, pid, &[Signer::from(&seeds)])?;
     }
     let (owner_key, give_key) = (*accounts[0].address(), *accounts[3].address());
     let o = wv::<O_LEN>(&mut accounts[2]);
@@ -317,10 +270,11 @@ fn create_order(pid: &Address, accounts: &mut [AccountView], r: &mut Rd) -> Prog
     wr!(o, O_FILLED, 0u64);
     for (i, w) in wants.iter().enumerate() {
         put(o, O_WANTS + 32 * i, w);
+        wr!(o, O_MINOUT + 8 * i, outs[i]);
     }
     o[O_WANT_COUNT] = wc as u8;
-    wr!(o, O_LIMIT_BPS, limit);
-    wr!(o, O_ABS_LIMIT, abs);
+    wr!(o, 250, 0u16); // limit_bps: reserved (rAny: limits are absolute)
+    wr!(o, 252, 0u64); // rCap: cumulative USD value of fills (1e-6 USD)
     wr!(o, O_MIN_FILL, min_fill);
     o[O_PARTIAL] = partial;
     wr!(o, O_EXPIRES, expires);

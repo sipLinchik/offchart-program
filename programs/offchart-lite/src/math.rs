@@ -1,4 +1,5 @@
-//! Pure arithmetic of the price / fill / fee checks. No Solana types: fuzzed on the host.
+//! Pure arithmetic of the fill / fee / floor checks and the exact ceiling used by the USD cap (`ceil_div_pow10`). No Solana types: fuzzed on the host.
+//! (`seller_ok` / `buyer_ok` / `pool_ok` are legacy relative-limit helpers of the r8 model, kept for the host tests; `settle` does not call them.)
 pub const BPS: u128 = 10_000;
 pub const PRICE_SCALE: u128 = 1_000_000_000_000;
 
@@ -86,6 +87,12 @@ pub fn pool_ok(attested: u64, quote_amount: u64, base_amount: u64, tolerance_bps
     Some(diff.checked_mul(BPS)? <= pool_x_base.checked_mul(tolerance_bps as u128)?)
 }
 
+/// rAny: the receiver\'s own floor. For its whole `total` it signed "at least `min_out`"; it gives `fill` and receives `net`.
+/// net/fill >= min_out/total  <=>  net*total >= min_out*fill (both sides < 2^128, nothing can overflow).
+pub fn floor_ok(net: u64, total: u64, min_out: u64, fill: u64) -> bool {
+    min_out > 0 && (net as u128) * (total as u128) >= (min_out as u128) * (fill as u128)
+}
+
 /// Volume rules. `fill` > 0, <= remaining, >= min_fill unless it exhausts the order,
 /// and a non-partial order must be filled whole in one go.
 pub fn fill_ok(fill: u64, total: u64, filled: u64, min_fill_bps: u16, partial_ok: bool) -> bool {
@@ -104,4 +111,22 @@ pub fn fill_ok(fill: u64, total: u64, filled: u64, min_fill_bps: u16, partial_ok
     }
     let min = fee_of(total, min_fill_bps);
     fill >= min
+}
+
+/// ceil(num / 10^sh) for sh < 16 without a 128-bit division (see program.rs `usd_value`).
+pub fn ceil_div_pow10(num: u128, sh: usize) -> u128 {
+    let five = 5u64.pow((sh % 16) as u32);
+    let s = (sh % 16) as u32;
+    let lost = num & ((1u128 << s) - 1) != 0;
+    let n1 = (num >> s) + lost as u128;
+    let mut q: u128 = 0;
+    let mut rem: u64 = 0;
+    let mut i = 8u32;
+    while i > 0 {
+        i -= 1;
+        let cur = (rem << 16) | ((n1 >> (16 * i)) & 0xffff) as u64;
+        q = (q << 16) | (cur / five) as u128;
+        rem = cur % five;
+    }
+    q + (rem != 0) as u128
 }
